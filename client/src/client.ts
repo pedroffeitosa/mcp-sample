@@ -78,11 +78,11 @@ class MCPClient {
       });
     });
 
-    this.server.stderr.on("data", (data) => {
+    this.server.stdout?.on("data", (data) => {
       console.error("❌ STDERR:", data.toString());
     });
 
-    this.server.on("error", (error) => {
+    this.server.stderr?.on("data", (data) => {
       console.error("❌ Server error:", error);
       this.cleanup();
     });
