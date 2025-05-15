@@ -1,34 +1,43 @@
-import { spawn, ChildProcess } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
+import { spawn, ChildProcess } from 'child_process';
+import { CacheService } from './cache/CacheService.js';
 
 // Type definitions for MCP messages
 interface MCPRequest {
-  jsonrpc: "2.0";
+  jsonrpc: string;
   id: string | number;
   method: string;
-  params?: Record<string, unknown>;
+  params: any;
 }
 
 interface MCPResponse {
-  jsonrpc: "2.0";
+  jsonrpc: string;
   id: string | number;
   result?: any;
-  error?: { code: number; message: string };
+  error?: {
+    code: number;
+    message: string;
+    data?: any;
+  };
 }
 
 interface Tool {
   name: string;
   description: string;
-  inputSchema: Record<string, unknown>;
+  parameters: Record<string, any>;
 }
 
-interface ClientConfig {
+export interface ClientConfig {
   serverPath?: string;
   timeout?: number;
   clientInfo?: {
     name: string;
     version: string;
+  };
+  cacheConfig?: {
+    enabled: boolean;
+    ttl?: number;
   };
 }
 
@@ -38,25 +47,31 @@ class MCPClient {
   private toolsListed = false;
   private tools: Tool[] = [];
   private messageHandlers: Map<string, (response: MCPResponse) => void> = new Map();
+  private serverPath: string;
+  private timeout: number;
+  private clientInfo: { name: string; version: string };
+  private cacheService?: CacheService;
 
   constructor(config: ClientConfig = {}) {
-    const {
-      serverPath = this.getDefaultServerPath(),
-      timeout = 30000,
-      clientInfo = { name: "mcp-client-sample", version: "1.0.0" }
-    } = config;
+    this.serverPath = config.serverPath ?? this.getDefaultServerPath();
+    this.timeout = config.timeout ?? 30000;
+    this.clientInfo = config.clientInfo ?? { name: "mcp-client-sample", version: "1.0.0" };
 
-    this.server = spawn("node", [serverPath], {
+    if (config.cacheConfig?.enabled) {
+      this.cacheService = new CacheService(config.cacheConfig.ttl);
+    }
+
+    this.server = spawn("node", [this.serverPath], {
       stdio: ["pipe", "pipe", "pipe"]
     });
 
     this.setupServerListeners();
-    this.initialize(clientInfo);
+    this.initialize(this.clientInfo);
 
     // Set timeout for cleanup
     setTimeout(() => {
       this.cleanup();
-    }, timeout);
+    }, this.timeout);
   }
 
   private getDefaultServerPath(): string {
@@ -66,25 +81,33 @@ class MCPClient {
   }
 
   private setupServerListeners(): void {
-    this.server.stdout.on("data", (data) => {
-      const lines = data.toString().trim().split("\n");
-      lines.forEach((line: string) => {
-        try {
-          const msg: MCPResponse = JSON.parse(line);
-          this.handleMessage(msg);
-        } catch (e) {
-          console.log("📄 Raw output:", line);
+    if (!this.server.stdout || !this.server.stderr) {
+      throw new Error('Server process streams not initialized');
+    }
+
+    this.server.stdout.on('data', (data: Buffer) => {
+      try {
+        const response: MCPResponse = JSON.parse(data.toString());
+        const handler = this.messageHandlers.get(response.id.toString());
+        if (handler) {
+          handler(response);
+          this.messageHandlers.delete(response.id.toString());
         }
-      });
+      } catch (err) {
+        console.error('Error parsing server response:', err);
+      }
     });
 
-    this.server.stdout?.on("data", (data) => {
-      console.error("❌ STDERR:", data.toString());
+    this.server.stderr.on('data', (data: Buffer) => {
+      console.error('Server error:', data.toString());
     });
 
-    this.server.stderr?.on("data", (data) => {
-      console.error("❌ Server error:", error);
-      this.cleanup();
+    this.server.on('error', (err: Error) => {
+      console.error('Server process error:', err);
+    });
+
+    this.server.on('exit', (code: number | null) => {
+      console.log('Server process exited with code:', code);
     });
   }
 
@@ -132,7 +155,7 @@ class MCPClient {
         console.log("🔧 Tools available:");
         this.tools.forEach((tool) => {
           console.log(`- ${tool.name}: ${tool.description}`);
-          console.log("  Input schema:", JSON.stringify(tool.inputSchema));
+          console.log("  Input schema:", JSON.stringify(tool.parameters));
         });
       }
     });
@@ -140,24 +163,68 @@ class MCPClient {
     this.sendMessage(listToolsMsg);
   }
 
-  public async executeTool(name: string, input: Record<string, unknown>): Promise<any> {
+  async executeTool<T = any>(tool: string, params: Record<string, any>): Promise<{
+    success: boolean;
+    data?: T;
+    error?: { code: string; message: string; details?: string };
+  }> {
+    // Check cache first if enabled
+    if (this.cacheService) {
+      const cacheKey = CacheService.generateKey(tool, params);
+      const cachedData = this.cacheService.get<{
+        success: boolean;
+        data?: T;
+        error?: { code: string; message: string; details?: string };
+      }>(cacheKey);
+
+      if (cachedData) {
+        return cachedData;
+      }
+    }
+
+    // Execute tool and cache result if successful
+    const result = await this._executeToolInternal<T>(tool, params);
+    
+    if (this.cacheService && result.success) {
+      const cacheKey = CacheService.generateKey(tool, params);
+      this.cacheService.set(cacheKey, result);
+    }
+
+    return result;
+  }
+
+  private async _executeToolInternal<T>(tool: string, params: Record<string, any>): Promise<{
+    success: boolean;
+    data?: T;
+    error?: { code: string; message: string; details?: string };
+  }> {
     return new Promise((resolve, reject) => {
       const toolCall: MCPRequest = {
         jsonrpc: "2.0",
         id: `call-${Date.now()}`,
         method: "tools/execute",
-        params: { name, input }
+        params: { name: tool, input: params }
       };
 
       this.messageHandlers.set(toolCall.id.toString(), (response: MCPResponse) => {
         if (response.error) {
-          reject(new Error(response.error.message));
+          resolve({
+            success: false,
+            error: {
+              code: response.error.code.toString(),
+              message: response.error.message,
+              details: response.error.data?.toString()
+            }
+          });
         } else {
-          resolve(response.result);
+          resolve({
+            success: true,
+            data: response.result as T
+          });
         }
       });
 
-      this.sendMessage(toolCall);
+      this.server.stdin?.write(JSON.stringify(toolCall) + "\n");
     });
   }
 
@@ -170,6 +237,9 @@ class MCPClient {
   public cleanup(): void {
     if (this.server) {
       this.server.kill();
+    }
+    if (this.cacheService) {
+      this.cacheService.clear();
     }
   }
 }
@@ -196,4 +266,4 @@ if (require.main === module) {
   main();
 }
 
-export { MCPClient, Tool, MCPRequest, MCPResponse }; 
+export { MCPClient }; 
